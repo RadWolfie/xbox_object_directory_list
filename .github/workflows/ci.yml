@@ -1,0 +1,117 @@
+name: GitHub CI
+
+permissions:
+  contents: write
+
+on:
+  push:
+    paths-ignore:
+      - '*.md'
+      - '*.yml'
+      - '.github/*'
+      - '.github/*_TEMPLATE/**'
+    tags:
+      - 'v*'
+    branches:
+      - '**'
+  pull_request:
+    paths-ignore:
+      - '*.md'
+      - '*.yml'
+      - '.github/*'
+      - '.github/*_TEMPLATE/**'
+  workflow_dispatch:
+
+
+env:
+  is_pr: ${{ startsWith(github.ref, 'refs/pull/') }}
+  repo_default: 'RadWolfie/xbox_object_directory_list'
+
+jobs:
+  lint:
+    name: Clang Lint Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: DoozyX/clang-format-lint-action@v0.11
+        with:
+          source: 'src'
+          extensions: 'h,c'
+          clangFormatVersion: 11
+  semver:
+    name: Generate Semver
+    runs-on: ubuntu-latest
+    outputs:
+      ver-prev: ${{ steps.semver-output.outputs.version_previous }}
+      ver-cur: ${{ steps.semver-output.outputs.version_current }}
+      # Hack method to generate true or false for jobs.
+      # Since job's "if" doesn't support env context.
+      do-build: ${{ steps.build-cond.outputs.do-build }}
+      do-release: ${{ github.repository == env.repo_default }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - uses: RadWolfie/Semantic-Version-Action@main
+        id: semver-output
+        with:
+          repository: ${{ env.repo_default }}
+          version_major_init: 1
+          version_minor_init: 0
+      - name: Run Build Conditional
+        id: build-cond
+        run: |
+          if [ "true" == "${{ (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch') || steps.semver-output.outputs.version_previous != steps.semver-output.outputs.version_current }}" ]
+          then
+            echo "do-build=true" >> $GITHUB_OUTPUT
+          else
+            echo "do-build=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Generate Changelog
+        if: steps.build-cond.outputs.do-build == 'true'
+        run: |
+          if [ "true" == "${{ env.is_pr }}" ]
+          then
+            git log --pretty=format:"%h: %s%n%w(0,11)%-b%n" ${{ steps.semver-output.outputs.version_previous }}..HEAD > changelog
+          else
+            git log --first-parent --pretty=format:"%h: %s%n%w(0,11)%-b%n" ${{ steps.semver-output.outputs.version_previous }}..HEAD > changelog
+          fi
+      # NOTE: Require to reduce workload from CI service from fetch whole git content.
+      - name: Upload Changelog
+        if: steps.build-cond.outputs.do-build == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: changelog
+          path: changelog
+  build:
+    runs-on: ubuntu-latest
+    needs: semver
+    if: needs.semver.outputs.do-build == 'true'
+    steps:
+      - name: Checkout ${{ github.event.repository.name }}
+        uses: actions/checkout@v3
+      - name: Build
+        run: docker run -v `pwd`:/usr/src/app -t ghcr.io/xboxdev/nxdk:latest make -j$(nproc)
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}
+          path: |
+            bin/*
+            LICENSE
+          if-no-files-found: error
+      - name: Download changelog artifact file
+        uses: actions/download-artifact@v3
+        with:
+          name: changelog
+          path: changelog
+      - name: Create release
+        if: |
+          github.event.action != 'pull_request' &&
+          github.ref == 'refs/heads/main'     &&
+          github.repository == env.repo_default
+        env:
+          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          7z a -mx1 "${{ github.event.repository.name }}.zip" "./bin/*" "./LICENSE"
+          gh release create ${{ needs.semver.outputs.ver-cur }} ${{ github.event.repository.name }}.zip --title "${{ needs.semver.outputs.ver-cur }}" --notes-file changelog/changelog --target $GITHUB_SHA
